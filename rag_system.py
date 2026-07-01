@@ -1,5 +1,5 @@
 """
-RAG (Retrieval-Augmented Generation) система с поддержкой локальных моделей
+RAG система с улучшенной сегментацией для больших документов
 """
 
 import os
@@ -12,49 +12,84 @@ from chromadb.config import Settings
 import PyPDF2
 import docx
 import pdfplumber
-import json
 from datetime import datetime
+import torch
 
 class TextSplitter:
-    """Класс для разбивки текста на семантически завершенные блоки"""
+    """Улучшенный класс для разбивки текста на семантические блоки"""
     
-    def __init__(self, chunk_size: int = 500, chunk_overlap: int = 100):
+    def __init__(self, chunk_size: int = 1200, chunk_overlap: int = 300):
+        """
+        Параметры:
+        - chunk_size: 1200 символов для сохранения полных разделов
+        - chunk_overlap: 300 символов перекрытия
+        """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
     
     def split_text(self, text: str) -> List[str]:
-        """Разбивает текст на смысловые блоки"""
+        """
+        Разбивает текст на смысловые блоки с учетом структуры
+        """
+        # Очистка текста
         text = re.sub(r'\s+', ' ', text).strip()
         
         if len(text) < 50:
             return [text] if text else []
         
-        sentences = re.split(r'(?<=[.!?])\s+(?=[А-ЯA-Z])', text)
+        # Пробуем разбить по номерам разделов (1., 2., 3.1, и т.д.)
+        section_pattern = r'(?=\d+\.\d+\.\s+[А-ЯA-Z][а-яa-z]+)|(?=\d+\.\s+[А-ЯA-Z][а-яa-z]+)|(?=Раздел\s+\d+)'
+        sections = re.split(section_pattern, text)
         
+        # Если есть разделы, объединяем их в осмысленные блоки
+        if len(sections) > 1:
+            merged = []
+            current = ""
+            for sec in sections:
+                sec = sec.strip()
+                if not sec:
+                    continue
+                if len(current) + len(sec) <= self.chunk_size:
+                    current += " " + sec if current else sec
+                else:
+                    if current:
+                        merged.append(current.strip())
+                    # Начинаем новый блок с перекрытием
+                    if self.chunk_overlap > 0 and current:
+                        overlap = current[-self.chunk_overlap:] if len(current) > self.chunk_overlap else current
+                        current = overlap + " " + sec
+                    else:
+                        current = sec
+            if current:
+                merged.append(current.strip())
+            return merged if merged else [text[:self.chunk_size]]
+        
+        # Если нет разделов, разбиваем по предложениям
+        sentences = re.split(r'(?<=[.!?])\s+(?=[А-ЯA-Z])', text)
         chunks = []
         current_chunk = ""
         
         for sentence in sentences:
             if not sentence.strip():
                 continue
-                
             if len(current_chunk) + len(sentence) <= self.chunk_size:
                 current_chunk += " " + sentence if current_chunk else sentence
             else:
                 if current_chunk:
                     chunks.append(current_chunk.strip())
-                current_chunk = sentence
+                if self.chunk_overlap > 0 and current_chunk:
+                    overlap = current_chunk[-self.chunk_overlap:] if len(current_chunk) > self.chunk_overlap else current_chunk
+                    current_chunk = overlap + " " + sentence
+                else:
+                    current_chunk = sentence
         
         if current_chunk:
             chunks.append(current_chunk.strip())
         
-        if not chunks and text:
-            chunks = [text[:self.chunk_size]]
-        
-        return chunks
+        return chunks if chunks else [text[:self.chunk_size]]
 
 class DocumentParser:
-    """Класс для парсинга документов разных форматов"""
+    """Класс для парсинга документов"""
     
     @staticmethod
     def parse_pdf(file_path: str) -> str:
@@ -99,85 +134,93 @@ class DocumentParser:
                 return ""
 
 class LocalLLM:
-    """
-    Класс для работы с локальными языковыми моделями
-    Поддерживает: Mistral, Llama, Gemma, Qwen и другие
-    """
+    """Класс для работы с локальной языковой моделью Qwen2.5"""
     
     def __init__(self, 
-                 model_name: str = "mistralai/Mistral-7B-Instruct-v0.1",
+                 model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
                  use_gpu: bool = True,
-                 quantize: bool = True):
-        """
-        Инициализация локальной модели
-        
-        Параметры:
-        - model_name: название модели из Hugging Face
-        - use_gpu: использовать ли GPU (если доступен)
-        - quantize: использовать ли 8-битную квантизацию (экономит память)
-        """
+                 max_length: int = 500,
+                 temperature: float = 0.3):
         self.model_name = model_name
         self.use_gpu = use_gpu
-        self.quantize = quantize
+        self.max_length = max_length
+        self.temperature = temperature
         self.model = None
         self.tokenizer = None
         self.is_loaded = False
+        self.device_info = {}
         
         print(f"📥 Подготовка к загрузке модели: {model_name}")
+        print(f"💻 Использовать GPU: {use_gpu}")
+    
+    def check_gpu(self):
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"✅ GPU доступен: {gpu_count} устройств")
+            print(f"   Модель GPU: {gpu_name}")
+            print(f"   Память GPU: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+            return True
+        else:
+            print("⚠️ GPU не доступен, используется CPU")
+            return False
     
     def load_model(self):
-        """Загрузка модели в память"""
         if self.is_loaded:
             print("Модель уже загружена")
             return
         
         try:
-            from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+            from transformers import AutoTokenizer, AutoModelForCausalLM
             import torch
             
             print("⏳ Загрузка модели... Это может занять несколько минут при первом запуске")
             
-            # Настройка квантизации (для экономии памяти)
-            if self.quantize:
-                bnb_config = BitsAndBytesConfig(
-                    load_in_8bit=True,
-                    bnb_8bit_compute_dtype=torch.float16,
-                )
-                quantization_config = bnb_config
+            gpu_available = self.check_gpu()
+            
+            if self.use_gpu and gpu_available:
+                device = "cuda"
+                dtype = torch.float16
+                print("🚀 Используется GPU (float16)")
             else:
-                quantization_config = None
+                device = "cpu"
+                dtype = torch.float32
+                print("💻 Используется CPU (float32)")
             
-            # Определяем устройство
-            device = "cuda" if self.use_gpu and torch.cuda.is_available() else "cpu"
-            print(f"💻 Используется устройство: {device}")
-            
-            # Загрузка токенизатора
+            print(f"📥 Загрузка токенизатора {self.model_name}...")
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 trust_remote_code=True
             )
             
-            # Добавляем pad_token если его нет
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            # Загрузка модели
+            print(f"📥 Загрузка модели {self.model_name}...")
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                quantization_config=quantization_config,
+                torch_dtype=dtype,
                 device_map="auto" if device == "cuda" else None,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True
             )
             
-            # Если нет GPU, перемещаем модель на CPU
             if device == "cpu":
+                print("Перемещение модели на CPU...")
                 self.model = self.model.to(device)
             
             self.is_loaded = True
-            self.device = device
-            print(f"✅ Модель успешно загружена на {device}!")
+            self.device_info = {
+                "device": device,
+                "dtype": str(dtype),
+                "gpu_available": gpu_available,
+                "model_size": f"{self.model.num_parameters() / 1e9:.1f}B"
+            }
+            
+            print(f"✅ Модель успешно загружена!")
+            print(f"   Устройство: {device}")
+            print(f"   Тип данных: {dtype}")
+            print(f"   Параметры: {self.model.num_parameters() / 1e9:.1f}B")
             
         except ImportError as e:
             raise ImportError(f"Необходимые библиотеки не установлены: {e}")
@@ -187,114 +230,70 @@ class LocalLLM:
     def generate_response(self, 
                           context: str, 
                           query: str,
-                          max_length: int = 500,
-                          temperature: float = 0.3,
-                          top_p: float = 0.9) -> str:
-        """
-        Генерация ответа на основе контекста
-        
-        Параметры:
-        - context: контекст из найденных документов
-        - query: вопрос пользователя
-        - max_length: максимальная длина ответа
-        - temperature: температура (креативность)
-        - top_p: параметр для nucleus sampling
-        """
+                          max_length: int = None,
+                          temperature: float = None) -> str:
+        """Генерация ответа на основе контекста"""
         if not self.is_loaded:
             self.load_model()
         
         try:
             import torch
             
-            # Формируем промпт в зависимости от модели
-            if "mistral" in self.model_name.lower():
-                prompt = f"""<s>[INST] 
-                Ты — эксперт по нормативной документации компании.
-                Используй ТОЛЬКО информацию из контекста для ответа на вопрос.
-                Если в контексте нет информации, скажи об этом честно.
-                
-                Контекст документов:
-                {context}
-                
-                Вопрос: {query}
-                
-                Дай четкий, структурированный ответ.
-                [/INST] """
+            max_new_tokens = max_length or self.max_length
+            temp = temperature or self.temperature
             
-            elif "llama" in self.model_name.lower() or "llama" in self.model_name.lower():
-                prompt = f"""<s>[INST] <<SYS>>
-                Ты — эксперт по нормативной документации компании. Отвечай только на основе контекста.
-                <</SYS>>
-                
-                Контекст:
-                {context}
-                
-                Вопрос: {query}
-                [/INST] """
+            # Ограничиваем контекст
+            if len(context) > 4000:
+                context = context[:4000] + "..."
             
-            elif "gemma" in self.model_name.lower():
-                prompt = f"""<bos><start_of_turn>user
-                Ты — эксперт по документации. Используй контекст для ответа.
-                
-                Контекст:
-                {context}
-                
-                Вопрос: {query}
-                <end_of_turn>
-                <start_of_turn>model"""
+            # Формат промпта для Qwen2.5
+            prompt = f"""<|im_start|>system
+Ты — эксперт по работе с системой 1С:Документооборот. Отвечай на вопросы пользователя, используя ТОЛЬКО информацию из предоставленного контекста.
+
+Правила:
+1. Если в контексте есть ответ на вопрос — дай его четко и структурированно.
+2. Если информации недостаточно — скажи: "В предоставленном документе нет информации по этому вопросу."
+3. Не выдумывай информацию, которой нет в контексте.
+4. При цитировании указывай раздел документа.<|im_end|>
+<|im_start|>user
+Контекст из документа:
+
+{context}
+
+Вопрос пользователя: {query}
+
+Дай ответ строго на основе контекста.<|im_end|>
+<|im_start|>assistant
+"""
             
-            elif "qwen" in self.model_name.lower():
-                prompt = f"""<s>Ты — эксперт по нормативной документации.
-                Контекст: {context}
-                
-                Вопрос: {query}
-                
-                Ответ:"""
-            
-            else:
-                # Универсальный промпт
-                prompt = f"""Контекст документов:
-                {context}
-                
-                Вопрос: {query}
-                
-                Ответ на основе контекста:"""
-            
-            # Токенизация
             inputs = self.tokenizer(
                 prompt, 
                 return_tensors="pt",
-                max_length=2048,
+                max_length=4096,
                 truncation=True
             )
             
-            # Перемещаем на устройство модели
-            if hasattr(self, 'device'):
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            device = next(self.model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
             
-            # Генерация
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=max_length,
-                    temperature=temperature,
-                    top_p=top_p,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temp,
                     do_sample=True,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    repetition_penalty=1.1
+                    repetition_penalty=1.1,
+                    top_p=0.9
                 )
             
-            # Декодирование
             response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Очищаем ответ от промпта
-            # Пытаемся найти часть после ответа модели
-            markers = ["[/INST]", "<start_of_turn>model", "Ответ:", "Ответ"]
-            for marker in markers:
-                if marker in response:
-                    response = response.split(marker)[-1].strip()
-                    break
+            if "<|im_start|>assistant" in response:
+                response = response.split("<|im_start|>assistant")[-1].strip()
+            if "<|im_end|>" in response:
+                response = response.split("<|im_end|>")[0].strip()
             
             return response
             
@@ -302,16 +301,14 @@ class LocalLLM:
             return f"Ошибка при генерации ответа: {str(e)}"
     
     def get_model_info(self) -> Dict:
-        """Получение информации о модели"""
         return {
             "model_name": self.model_name,
             "is_loaded": self.is_loaded,
-            "device": getattr(self, 'device', 'unknown'),
-            "quantized": self.quantize
+            **self.device_info
         }
 
 class RAGSystem:
-    """Основной класс RAG-системы"""
+    """Основной класс RAG-системы с улучшенным поиском"""
     
     def __init__(self, 
                  embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
@@ -338,7 +335,7 @@ class RAGSystem:
                 metadata={"hnsw:space": "cosine"}
             )
         
-        self.splitter = TextSplitter()
+        self.splitter = TextSplitter(chunk_size=1200, chunk_overlap=300)
         self.parser = DocumentParser()
         
         print(f"Система инициализирована. Размерность векторов: {self.vector_dimension}")
@@ -410,7 +407,7 @@ class RAGSystem:
                 metadatas=metadata_list,
                 ids=ids
             )
-            print(f"Добавлено {len(chunks)} блоков")
+            print(f"✅ Добавлено {len(chunks)} блоков")
         except Exception as e:
             print(f"Ошибка: {e}")
             return 0
@@ -424,9 +421,10 @@ class RAGSystem:
         query_embedding = self.embedding_model.encode(query).tolist()
         
         try:
+            # Ищем в 2 раза больше для лучшего охвата
             results = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=min(top_k, self.collection.count()),
+                n_results=min(top_k * 2, self.collection.count()),
                 include=["documents", "metadatas", "distances"]
             )
         except Exception as e:
@@ -436,13 +434,16 @@ class RAGSystem:
         documents = []
         if results and 'documents' in results and results['documents']:
             for i, doc in enumerate(results['documents'][0]):
-                documents.append({
-                    "text": doc,
-                    "metadata": results['metadatas'][0][i] if results['metadatas'] else {},
-                    "similarity_score": 1 - results['distances'][0][i] if results['distances'] else 0.0
-                })
+                score = 1 - results['distances'][0][i] if results['distances'] else 0.0
+                # Фильтруем только релевантные результаты
+                if score > 0.25:
+                    documents.append({
+                        "text": doc,
+                        "metadata": results['metadatas'][0][i] if results['metadatas'] else {},
+                        "similarity_score": score
+                    })
         
-        return documents
+        return documents[:top_k]
     
     def get_database_stats(self) -> Dict:
         try:
@@ -476,116 +477,57 @@ class RAGSystem:
         print("База данных очищена")
 
 class RAGWithLLM:
-    """Класс для RAG с различными типами генерации"""
+    """Класс для RAG с локальной моделью"""
     
     def __init__(self, rag_system: RAGSystem):
         self.rag = rag_system
         self.local_llm = None
     
-    def get_answer_with_openai(self, query: str, top_k: int = 3) -> Dict:
-        try:
-            import openai
-            
-            similar_chunks = self.rag.search(query, top_k=top_k)
-            
-            if not similar_chunks:
-                return {
-                    "answer": "В базе документов нет информации по вашему запросу.",
-                    "sources": []
-                }
-            
-            context = "\n\n".join([
-                f"Источник {i+1}: {chunk['text']}" 
-                for i, chunk in enumerate(similar_chunks)
-            ])
-            
-            prompt = f"""
-            Ты — эксперт по нормативной документации организации.
-            На основе контекста ответь на вопрос.
-            
-            Контекст:
-            {context}
-            
-            Вопрос: {query}
-            
-            Дай четкий ответ. Если информации недостаточно, скажи об этом.
-            """
-            
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "Ты полезный эксперт по документации."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=1000
-            )
-            
-            return {
-                "answer": response.choices[0].message.content,
-                "sources": [
-                    {
-                        "document": chunk['metadata'].get('document_name', 'Неизвестный'),
-                        "text": chunk['text'],
-                        "score": chunk['similarity_score']
-                    }
-                    for chunk in similar_chunks
-                ]
-            }
-            
-        except Exception as e:
-            return {"error": f"Ошибка OpenAI: {str(e)}"}
-    
-    def get_answer_local(self, query: str, top_k: int = 3, 
-                         model_name: str = None,
+    def load_local_model(self, 
+                         model_name: str = "Qwen/Qwen2.5-1.5B-Instruct", 
                          use_gpu: bool = True,
-                         quantize: bool = True) -> Dict:
-        """
-        Получение ответа через локальную модель
-        """
+                         max_length: int = 500,
+                         temperature: float = 0.3) -> Dict:
         try:
-            # Если модель не инициализирована или другая модель
-            if self.local_llm is None or (model_name and self.local_llm.model_name != model_name):
-                if model_name is None:
-                    # По умолчанию используем легкую модель
-                    model_name = "microsoft/phi-2"  # Легкая модель, работает даже на CPU
-                    # Альтернативы:
-                    # "mistralai/Mistral-7B-Instruct-v0.1" - качественная, требует GPU
-                    # "HuggingFaceH4/zephyr-7b-beta" - хорошая альтернатива
-                    # "google/gemma-2b-it" - маленькая, быстрая
-                    # "Qwen/Qwen-1_8B-Chat" - хорошая для русского
-                
-                self.local_llm = LocalLLM(
-                    model_name=model_name,
-                    use_gpu=use_gpu,
-                    quantize=quantize
-                )
-                self.local_llm.load_model()
+            self.local_llm = LocalLLM(
+                model_name=model_name,
+                use_gpu=use_gpu,
+                max_length=max_length,
+                temperature=temperature
+            )
+            self.local_llm.load_model()
+            return {"success": True, "model_info": self.local_llm.get_model_info()}
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def get_answer_local(self, query: str, top_k: int = 3) -> Dict:
+        try:
+            if self.local_llm is None or not self.local_llm.is_loaded:
+                return {"error": "Модель не загружена"}
             
-            # Поиск релевантных блоков
             similar_chunks = self.rag.search(query, top_k=top_k)
             
             if not similar_chunks:
                 return {
-                    "answer": "В базе документов нет информации по вашему запросу.",
+                    "answer": "📭 В базе документов нет информации по вашему запросу.\n\n💡 Попробуйте:\n• Переформулировать запрос\n• Загрузить больше документов",
                     "sources": []
                 }
             
-            # Формируем контекст
-            context = "\n\n".join([
-                f"Документ {i+1} ({chunk['metadata'].get('document_name', 'Неизвестный')}): {chunk['text']}" 
-                for i, chunk in enumerate(similar_chunks)
-            ])
+            # Формируем контекст с номерами разделов
+            context = ""
+            for i, chunk in enumerate(similar_chunks, 1):
+                doc_name = chunk['metadata'].get('document_name', 'Неизвестный')
+                context += f"\n--- Источник {i} ({doc_name}) ---\n"
+                context += chunk['text'] + "\n"
             
-            # Генерируем ответ
             answer = self.local_llm.generate_response(context, query)
             
             return {
                 "answer": answer,
                 "sources": [
                     {
-                        "document": chunk['metadata'].get('document_name', 'Неизвестный документ'),
-                        "text": chunk['text'],
+                        "document": chunk['metadata'].get('document_name', 'Неизвестный'),
+                        "text": chunk['text'][:300] + "..." if len(chunk['text']) > 300 else chunk['text'],
                         "score": chunk['similarity_score']
                     }
                     for chunk in similar_chunks
@@ -593,35 +535,5 @@ class RAGWithLLM:
                 "model_info": self.local_llm.get_model_info()
             }
             
-        except ImportError as e:
-            return {"error": f"Не установлены библиотеки: {e}"}
         except Exception as e:
-            return {"error": f"Ошибка локальной модели: {str(e)}"}
-    
-    def get_answer_simple(self, query: str, top_k: int = 3) -> Dict:
-        """Простой поиск без генерации"""
-        similar_chunks = self.rag.search(query, top_k=top_k)
-        
-        if not similar_chunks:
-            return {
-                "answer": "Информация не найдена. Попробуйте переформулировать запрос.",
-                "sources": []
-            }
-        
-        answer = "🔍 Найдена информация:\n\n"
-        for i, chunk in enumerate(similar_chunks, 1):
-            answer += f"{i}. {chunk['text']}\n"
-            answer += f"   📄 {chunk['metadata'].get('document_name', 'Неизвестный')}\n"
-            answer += f"   📊 Релевантность: {chunk['similarity_score']:.2%}\n\n"
-        
-        return {
-            "answer": answer,
-            "sources": [
-                {
-                    "document": chunk['metadata'].get('document_name', 'Неизвестный'),
-                    "text": chunk['text'],
-                    "score": chunk['similarity_score']
-                }
-                for chunk in similar_chunks
-            ]
-        }
+            return {"error": f"Ошибка: {str(e)}"}

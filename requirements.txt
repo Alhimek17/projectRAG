@@ -1,27 +1,19 @@
 # Основные библиотеки
+streamlit==1.29.0
 sentence-transformers==2.2.2
 chromadb==0.4.22
-langchain==0.1.0
-langchain-community==0.1.0
 
 # Для работы с документами
 PyPDF2==3.0.1
 python-docx==1.1.0
 pdfplumber==0.10.3
 
-# Для работы с ИИ-моделями (выберите один вариант)
-# Вариант 1: OpenAI (платный, но качественный)
-openai==1.6.1
-
-# Вариант 2: Бесплатная локальная модель (рекомендуется для прототипа)
+# Для локальной модели
 transformers==4.36.2
 torch==2.1.0
+sentencepiece==0.1.99
 accelerate==0.25.0
-
-# Для веб-интерфейса
-streamlit==1.29.0
 
 # Вспомогательные
 python-dotenv==1.0.0
 numpy==1.24.3
-pandas==2.1.4
