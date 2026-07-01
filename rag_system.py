@@ -19,29 +19,18 @@ class TextSplitter:
     """Улучшенный класс для разбивки текста на семантические блоки"""
     
     def __init__(self, chunk_size: int = 1200, chunk_overlap: int = 300):
-        """
-        Параметры:
-        - chunk_size: 1200 символов для сохранения полных разделов
-        - chunk_overlap: 300 символов перекрытия
-        """
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
     
     def split_text(self, text: str) -> List[str]:
-        """
-        Разбивает текст на смысловые блоки с учетом структуры
-        """
-        # Очистка текста
         text = re.sub(r'\s+', ' ', text).strip()
         
         if len(text) < 50:
             return [text] if text else []
         
-        # Пробуем разбить по номерам разделов (1., 2., 3.1, и т.д.)
         section_pattern = r'(?=\d+\.\d+\.\s+[А-ЯA-Z][а-яa-z]+)|(?=\d+\.\s+[А-ЯA-Z][а-яa-z]+)|(?=Раздел\s+\d+)'
         sections = re.split(section_pattern, text)
         
-        # Если есть разделы, объединяем их в осмысленные блоки
         if len(sections) > 1:
             merged = []
             current = ""
@@ -54,7 +43,6 @@ class TextSplitter:
                 else:
                     if current:
                         merged.append(current.strip())
-                    # Начинаем новый блок с перекрытием
                     if self.chunk_overlap > 0 and current:
                         overlap = current[-self.chunk_overlap:] if len(current) > self.chunk_overlap else current
                         current = overlap + " " + sec
@@ -64,7 +52,6 @@ class TextSplitter:
                 merged.append(current.strip())
             return merged if merged else [text[:self.chunk_size]]
         
-        # Если нет разделов, разбиваем по предложениям
         sentences = re.split(r'(?<=[.!?])\s+(?=[А-ЯA-Z])', text)
         chunks = []
         current_chunk = ""
@@ -232,7 +219,7 @@ class LocalLLM:
                           query: str,
                           max_length: int = None,
                           temperature: float = None) -> str:
-        """Генерация ответа на основе контекста"""
+        """Генерация ответа на основе контекста - с жесткой очисткой"""
         if not self.is_loaded:
             self.load_model()
         
@@ -242,13 +229,12 @@ class LocalLLM:
             max_new_tokens = max_length or self.max_length
             temp = temperature or self.temperature
             
-            # Ограничиваем контекст
             if len(context) > 4000:
                 context = context[:4000] + "..."
             
             # Формат промпта для Qwen2.5
             prompt = f"""<|im_start|>system
-Ты — эксперт по работе с системой 1С:Документооборот. Отвечай на вопросы пользователя, используя ТОЛЬКО информацию из предоставленного контекста.
+Ты — эксперт по нормативной документации компании. Отвечай на вопросы пользователя, используя ТОЛЬКО информацию из предоставленного контекста.
 
 Правила:
 1. Если в контексте есть ответ на вопрос — дай его четко и структурированно.
@@ -288,12 +274,67 @@ class LocalLLM:
                     top_p=0.9
                 )
             
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            full_response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            if "<|im_start|>assistant" in response:
-                response = response.split("<|im_start|>assistant")[-1].strip()
+            # === ЖЕСТКАЯ ОЧИСТКА ОТВЕТА ===
+            
+            # 1. Пытаемся найти часть после "assistant"
+            if "<|im_start|>assistant" in full_response:
+                response = full_response.split("<|im_start|>assistant")[-1].strip()
+            else:
+                response = full_response.strip()
+            
+            # 2. Убираем <|im_end|>
             if "<|im_end|>" in response:
                 response = response.split("<|im_end|>")[0].strip()
+            
+            # 3. Убираем "Ответ:" в начале
+            if response.startswith("Ответ:"):
+                response = response[6:].strip()
+            if response.startswith("Ответ"):
+                response = response[5:].strip()
+            
+            # 4. Если в ответе есть "assistant" - убираем
+            if response.startswith("assistant"):
+                response = response[9:].strip()
+            
+            # 5. Проверяем, не содержит ли ответ системный промпт
+            # Если ответ начинается с "system" или содержит "Ты — эксперт"
+            if response.startswith("system") or "Ты — эксперт" in response[:200]:
+                # Ищем часть после последнего "Вопрос пользователя:"
+                if "Вопрос пользователя:" in response:
+                    parts = response.split("Вопрос пользователя:")
+                    if len(parts) > 1:
+                        response = parts[-1].strip()
+                        # Убираем "Дай ответ строго на основе контекста."
+                        if "Дай ответ строго на основе контекста." in response:
+                            response = response.split("Дай ответ строго на основе контекста.")[-1].strip()
+            
+            # 6. Если ответ все еще содержит системный промпт - обрезаем по ключевым словам
+            forbidden_start = [
+                "system",
+                "Ты — эксперт",
+                "Правила:",
+                "Если в контексте"
+            ]
+            
+            for word in forbidden_start:
+                if response.startswith(word) or word in response[:300]:
+                    if "Вопрос пользователя:" in response:
+                        response = response.split("Вопрос пользователя:")[-1].strip()
+                        if "Дай ответ строго" in response:
+                            response = response.split("Дай ответ строго")[0].strip()
+                        break
+                    elif "Контекст из документа:" in response:
+                        response = response.split("Контекст из документа:")[0].strip()
+                        break
+                    elif "assistant" in response:
+                        response = response.split("assistant")[-1].strip()
+                        break
+            
+            # 7. Если ответ пустой или слишком короткий
+            if len(response) < 10:
+                response = "Нет информации по данному вопросу."
             
             return response
             
@@ -421,7 +462,6 @@ class RAGSystem:
         query_embedding = self.embedding_model.encode(query).tolist()
         
         try:
-            # Ищем в 2 раза больше для лучшего охвата
             results = self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=min(top_k * 2, self.collection.count()),
@@ -435,7 +475,6 @@ class RAGSystem:
         if results and 'documents' in results and results['documents']:
             for i, doc in enumerate(results['documents'][0]):
                 score = 1 - results['distances'][0][i] if results['distances'] else 0.0
-                # Фильтруем только релевантные результаты
                 if score > 0.25:
                     documents.append({
                         "text": doc,
@@ -509,11 +548,10 @@ class RAGWithLLM:
             
             if not similar_chunks:
                 return {
-                    "answer": "📭 В базе документов нет информации по вашему запросу.\n\n💡 Попробуйте:\n• Переформулировать запрос\n• Загрузить больше документов",
-                    "sources": []
+                    "answer": "📭 В базе документов нет информации по вашему запросу.\n\n💡 Попробуйте:\n• Переформулировать запрос\n• Загрузить больше документов"
                 }
             
-            # Формируем контекст с номерами разделов
+            # Формируем контекст
             context = ""
             for i, chunk in enumerate(similar_chunks, 1):
                 doc_name = chunk['metadata'].get('document_name', 'Неизвестный')
@@ -524,14 +562,6 @@ class RAGWithLLM:
             
             return {
                 "answer": answer,
-                "sources": [
-                    {
-                        "document": chunk['metadata'].get('document_name', 'Неизвестный'),
-                        "text": chunk['text'][:300] + "..." if len(chunk['text']) > 300 else chunk['text'],
-                        "score": chunk['similarity_score']
-                    }
-                    for chunk in similar_chunks
-                ],
                 "model_info": self.local_llm.get_model_info()
             }
             
